@@ -192,10 +192,5 @@ This codebase is perfect for:
 
 ---
 
-## License
-
-MIT
-
----
-
+## License - MIT
 **Note**: This is hobby code. Have fun, break things, learn from it, but don't run it in production without understanding the tradeoffs!
