@@ -220,7 +220,6 @@ const initKv = async () => {
 };
 
 // in-memory slug locks
-// in-memory slug locks
 const slugLocks = new Map<string, number>();
 
 const acquire_lock = async (key: string, timeout = 5000): Promise<boolean> => {
@@ -524,8 +523,6 @@ class PostService {
           }
         }
         posts.push(post);
-        // optimizing: if no Q, we can stop after limit + offset
-        // but with Q, need to scan.
       }
     }
 
@@ -568,16 +565,12 @@ const make_token = async (userId: string, csrfToken: string): Promise<string> =>
 const check_token = async (token: string): Promise<any> => {
   try {
     const payload = await verifyJwt(token, jwt_key);
-
-    // robust validation
     if (!payload || typeof payload !== 'object') return null;
     if (!payload.jti || typeof payload.jti !== 'string') return null;
     if (!payload.exp || typeof payload.exp !== 'number') return null;
     if (payload.exp * 1000 < Date.now()) return null;
     if (payload.type !== "access") return null;
     if (!payload.sub || typeof payload.sub !== 'string') return null;
-
-    // check JTI blacklist in KV
     const blacklisted = await kv.get(["blacklist", payload.jti]);
     if (blacklisted.value) return null;
 
