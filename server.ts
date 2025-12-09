@@ -33,6 +33,8 @@ const bind_ip = Deno.env.get("ENFORCE_IP_BINDING") === "true";
 const trust_proxy = Deno.env.get("TRUST_PROXY") === "true";
 const max_blacklist = 10000;
 const max_sessions = 10;
+const max_stored_ips = 10000;
+const max_stored_users = 10000;
 
 // check jwt secret is strong
 const check_secret = (secret: string): void => {
@@ -149,6 +151,7 @@ interface RefreshSession {
   expiresAt: number;
   ip: string;
   tokenHash: string;
+  csrfToken: string;
   userAgent?: string;
   createdAt: number;
 }
@@ -216,6 +219,7 @@ const initKv = async () => {
   kv = await Deno.openKv();
 };
 
+// in-memory slug locks
 // in-memory slug locks
 const slugLocks = new Map<string, number>();
 
@@ -357,42 +361,41 @@ class PostService {
         }
       }
 
+      const id = crypto.randomUUID();
+      const now = new Date().toISOString();
 
-    const id = crypto.randomUUID();
-    const now = new Date().toISOString();
+      const post: Post = {
+        id,
+        uid: userId,
+        slug: finalSlug,
+        title: data.title,
+        body: data.body,
+        sanitizedBody: data.sanitizedBody,
+        tags: data.tags,
+        views: 0,
+        likes: [],
+        created: now,
+        updated: now,
+        published: data.published,
+        deleted: false,
+      };
 
-    const post: Post = {
-      id,
-      uid: userId,
-      slug: finalSlug,
-      title: data.title,
-      body: data.body,
-      sanitizedBody: data.sanitizedBody,
-      tags: data.tags,
-      views: 0,
-      likes: [],
-      created: now,
-      updated: now,
-      published: data.published,
-      deleted: false,
-    };
+      const atomic = this.kv.atomic();
+      atomic
+        .check({ key: ["slugs", finalSlug], versionstamp: null })
+        .set(["posts", id], post)
+        .set(["slugs", finalSlug], id)
+        .set(["posts_by_user", userId, id], id)
+        .set(["posts_by_created", now, id], id); // time index
 
-    const atomic = this.kv.atomic();
-    atomic
-      .check({ key: ["slugs", finalSlug], versionstamp: null })
-      .set(["posts", id], post)
-      .set(["slugs", finalSlug], id)
-      .set(["posts_by_user", userId, id], id)
-      .set(["posts_by_created", now, id], id); // time index
+      for (const tag of data.tags) {
+        atomic.set(["posts_by_tag", tag, id], id);
+      }
 
-    for (const tag of data.tags) {
-      atomic.set(["posts_by_tag", tag, id], id);
-    }
-
-    const res = await atomic.commit();
-    if (!res.ok) {
-      throw new Error("Failed to create post (slug collision), please try again");
-    }
+      const res = await atomic.commit();
+      if (!res.ok) {
+        throw new Error("Failed to create post (slug collision), please try again");
+      }
 
       eventBus.emit('post.created', { id, slug: finalSlug, timestamp: now, userId });
       return post;
@@ -453,6 +456,10 @@ class PostService {
     const post = await this.findById(id);
     if (!post || post.deleted) throw new NotFoundError("Post not found");
 
+    if (!post.published) {
+      throw new AuthzErr("Cannot like unpublished posts");
+    }
+
     const likesSet = new Set(post.likes);
     const hasLiked = likesSet.has(userId);
 
@@ -496,7 +503,17 @@ class PostService {
     // fixme: slow for deep pages
     // But sufficient for this demo.
 
+    const maxOffset = 1000;
+    const offset = (page - 1) * limit;
+    if (offset > maxOffset) {
+      throw new ValidErr(`Maximum offset is ${maxOffset}. Use filters to narrow results.`);
+    }
+
+    let scanned = 0;
+    const maxScan = offset + limit + 100;
+
     for await (const entry of iter) {
+      if (scanned++ > maxScan) break;
       const postId = entry.value as string;
       const post = await this.findById(postId);
 
@@ -612,7 +629,7 @@ class AuthService {
     return this.createSession(user, ip, ua);
   }
 
-  async refresh(token: string, ip: string, ua: string): Promise<{ accessToken: string; refreshToken: string; csrfToken: string }> {
+  async refresh(token: string, csrfToken: string, ip: string, ua: string): Promise<{ accessToken: string; refreshToken: string; csrfToken: string }> {
     const tokenHash = await hash_token(token);
     const sessionRes = await this.kv.get<RefreshSession>(["sessions", tokenHash]);
     const session = sessionRes.value;
@@ -625,6 +642,12 @@ class AuthService {
     if (bind_ip && session.ip !== ip) {
       await this.kv.delete(["sessions", tokenHash]);
       throw new AuthzErr("IP mismatch detected");
+    }
+
+    // validate CSRF token
+    if (!session.csrfToken || session.csrfToken !== csrfToken) {
+      await this.kv.delete(["sessions", tokenHash]);
+      throw new AuthzErr("Invalid CSRF token");
     }
 
     const user = await this.userService.findById(session.uid);
@@ -734,6 +757,7 @@ class AuthService {
       expiresAt: Date.now() + refresh_exp * 1000,
       ip,
       tokenHash,
+      csrfToken,
       userAgent: ua,
       createdAt: Date.now(),
     };
@@ -790,6 +814,22 @@ class AuthService {
     }
 
     await this.userService.update(user.id, { failedLogins, lockedUntil });
+  }
+
+  async verify_email(token: string): Promise<void> {
+    const tokenHash = await hash_token(token);
+    const userIdRes = await this.kv.get<string>(["email_verification", tokenHash]);
+
+    if (!userIdRes.value) {
+      throw new AuthErr("Invalid or expired verification token");
+    }
+
+    const userId = userIdRes.value;
+    const user = await this.userService.findById(userId);
+    if (!user) throw new AuthErr("User not found");
+
+    await this.userService.update(userId, { verified: true });
+    await this.kv.delete(["email_verification", tokenHash]);
   }
 }
 
@@ -848,9 +888,14 @@ const user_rules = z.object({
 
 const page_rules = z.object({
   page: z.coerce.number().int().min(1).default(1),
-  limit: z.coerce.number().int().min(1).max(100).default(10),
-}).refine((data) => (data.page - 1) * data.limit <= 10000, {
-  message: "Offset too large (max 10000)",
+  limit: z.coerce.number().min(1).max(100).default(20),
+}).refine((data) => (data.page - 1) * data.limit <= 1000, {
+  message: "Offset too large (max 1000)",
+});
+
+const user_update_rules = z.object({
+  name: z.string().min(2).max(50).optional(),
+  email: z.string().email().optional(),
 });
 
 // utils
@@ -1192,6 +1237,12 @@ const rateLimit: Fn = (() => {
       return error_response("Rate limit exceeded", 429);
     }
 
+    if (!requestsByIp.has(ip) && requestsByIp.size >= max_stored_ips) {
+      // simple eviction: clear 10% or just clear all?
+      // for simplicity, clear all to avoid complex LRU here
+      requestsByIp.clear();
+    }
+
     ipHistory.push(nowTs);
     requestsByIp.set(ip, ipHistory);
 
@@ -1203,6 +1254,10 @@ const rateLimit: Fn = (() => {
 
       if (userHistory.length >= rate_max * 2) {
         return error_response("User rate limit exceeded", 429);
+      }
+
+      if (!requestsByUser.has(ctx.user.id) && requestsByUser.size >= max_stored_users) {
+        requestsByUser.clear();
       }
 
       userHistory.push(nowTs);
@@ -1237,6 +1292,10 @@ const loginRateLimit: Fn = (() => {
 
     if (history.length >= login_rate_max) {
       return error_response("Too many login attempts", 429);
+    }
+
+    if (!attempts.has(key) && attempts.size >= max_stored_ips) {
+      attempts.clear();
     }
 
     history.push(nowTs);
@@ -1360,12 +1419,18 @@ const register = async (_req: Request, ctx: Ctx) => {
 
   try {
     const newUser = await ctx.services.users.create({ name, email, pwd: hashedPwd });
+
+    const verifyToken = refresh_token();
+    const tokenHash = await hash_token(verifyToken);
+    await kv.set(["email_verification", tokenHash], newUser.id, { expireIn: 86400000 });
+    console.log(`[SECURITY] Email verification required for user ${newUser.id}`);
+
     return json_response(strip_sensitive(newUser), 201);
   } catch (e) {
     if (e instanceof ConflictError) {
       // timing protection
       await random_delay();
-      return error_response("Registration failed", 400);
+      return error_response("Registration failed - please try again or contact support", 400);
     }
     throw e;
   }
@@ -1386,6 +1451,8 @@ const login = async (req: Request, ctx: Ctx) => {
 
     // httponly cookies (no XSS)
     const cookieHeader = refresh_cookie(authResult.refreshToken);
+
+    log_audit("LOGIN", authResult.user.id, { ip: clientIp, userAgent });
 
     return new Response(JSON.stringify({
       accessToken: authResult.accessToken,
@@ -1420,8 +1487,13 @@ const refresh = async (req: Request, ctx: Ctx) => {
 
   const clientIp = get_ip(req);
   const userAgent = get_agent(req);
+  const csrfToken = req.headers.get("X-CSRF-Token");
 
-  const rotated = await ctx.services.auth.refresh(refreshToken, clientIp, userAgent);
+  if (!csrfToken) {
+    return error_response("CSRF token required", 403);
+  }
+
+  const rotated = await ctx.services.auth.refresh(refreshToken, csrfToken, clientIp, userAgent);
 
   // rotating token
   const cookieHeader = refresh_cookie(rotated.refreshToken);
@@ -1496,7 +1568,36 @@ const revokeSession = async (_req: Request, ctx: Ctx) => {
 
   try {
     await ctx.services.auth.revokeSession(ctx.user.id, tokenHash);
+    log_audit("REVOKE_SESSION", ctx.user.id, { tokenHash });
     return json_response({ message: "Session revoked successfully" });
+  } catch (e) {
+    if (e instanceof NotFoundError) return error_response(e.message, 404);
+    throw e;
+  }
+};
+
+const updateUser = async (_req: Request, match: URLPatternResult, ctx: Ctx) => {
+  if (!ctx.user) return error_response("Unauthorized", 401);
+
+  const userId = match.pathname.groups.id!;
+  if (!uuid_rules.safeParse(userId).success) {
+    return error_response("Invalid user ID format", 400);
+  }
+
+  // only allow self or admin
+  if (ctx.user.id !== userId && ctx.user.role !== 'admin') {
+    return error_response("Forbidden", 403);
+  }
+
+  const parsed = user_update_rules.safeParse(ctx.body);
+  if (!parsed.success) {
+    return error_response(parsed.error.errors[0].message);
+  }
+
+  try {
+    const updated = await ctx.services.users.update(userId, parsed.data);
+    log_audit("UPDATE_USER", ctx.user.id, { targetUserId: userId, updates: parsed.data });
+    return json_response(strip_sensitive(updated));
   } catch (e) {
     if (e instanceof NotFoundError) return error_response(e.message, 404);
     throw e;
@@ -1518,6 +1619,9 @@ const getUsers = async (req: Request, ctx: Ctx) => {
   }
 
   const q = qParsed.data?.toLowerCase();
+
+  if (!ctx.user) return error_response("Unauthorized", 401);
+  log_audit("LIST_USERS", ctx.user.id, { page: pagination.page, limit: pagination.limit, query: q });
 
   const result = await ctx.services.users.findAll({
     page: pagination.page,
@@ -1736,6 +1840,12 @@ const routes: Route[] = [
     middleware: [loginRateLimit],
   },
   {
+    method: "GET",
+    pattern: new URLPattern({ pathname: "/v1/auth/sessions" }),
+    handler: (req, _, ctx) => listSessions(req, ctx),
+    middleware: [auth],
+  },
+  {
     method: "POST",
     pattern: new URLPattern({ pathname: "/v1/auth/logout" }),
     handler: (req, _, ctx) => logout(req, ctx),
@@ -1751,7 +1861,13 @@ const routes: Route[] = [
     method: "GET",
     pattern: new URLPattern({ pathname: "/v1/users" }),
     handler: (req, _, ctx) => getUsers(req, ctx),
-    middleware: [auth],
+    middleware: [auth, admin],
+  },
+  {
+    method: "PATCH",
+    pattern: new URLPattern({ pathname: "/v1/users/:id" }),
+    handler: (req, match, ctx) => updateUser(req, match, ctx),
+    middleware: [auth, csrfProtection],
   },
   {
     method: "GET",
@@ -1815,7 +1931,7 @@ const create_handler = (services: Services) => async (req: Request): Promise<Res
       headers: {
         "Access-Control-Allow-Origin": allowedOrigin || allowed_origins[0],
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization, X-CSRF-Token",
         "Access-Control-Allow-Credentials": "true",
         "Access-Control-Max-Age": "86400",
       },
@@ -1960,10 +2076,9 @@ const startup = async () => {
   console.log("");
 
   // cleanup stale locks every min
-  // setInterval(clean_locks, 60000);
+  setInterval(clean_locks, 60000);
 
   await serve(create_handler(services), { port: port });
 };
 
 startup();
-
