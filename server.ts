@@ -217,7 +217,7 @@ const initKv = async () => {
 };
 
 // in-memory slug locks
-const slugLocks = new Map<string, boolean>();
+const slugLocks = new Map<string, number>();
 
 const acquire_lock = async (key: string, timeout = 5000): Promise<boolean> => {
   const start = Date.now();
@@ -225,12 +225,21 @@ const acquire_lock = async (key: string, timeout = 5000): Promise<boolean> => {
     if (Date.now() - start > timeout) return false;
     await new Promise((r) => setTimeout(r, 100));
   }
-  slugLocks.set(key, true);
+  slugLocks.set(key, Date.now());
   return true;
 };
 
 const release_lock = (key: string) => {
   slugLocks.delete(key);
+};
+
+const clean_locks = () => {
+  const now = Date.now();
+  for (const [key, time] of slugLocks.entries()) {
+    if (now - time > 30000) { // 30s max lock time
+      slugLocks.delete(key);
+    }
+  }
 };
 
 // services
@@ -331,16 +340,23 @@ class PostService {
     let finalSlug = slug;
     let counter = 1;
 
-    // make slug
-    // todo: distributed locks
-
-
-    while (true) {
-      const existing = await this.kv.get(["slugs", finalSlug]);
-      if (!existing.value) break;
-      finalSlug = `${slug}-${counter}`;
-      counter++;
+    const lockKey = `slug_gen:${slug}`;
+    const locked = await acquire_lock(lockKey, 5000);
+    if (!locked) {
+      throw new Error("Failed to acquire slug lock, please try again");
     }
+
+    try {
+      while (true) {
+        const existing = await this.kv.get(["slugs", finalSlug]);
+        if (!existing.value) break;
+        finalSlug = `${slug}-${counter}`;
+        counter++;
+        if (counter > 100) {
+          throw new Error("Unable to generate unique slug");
+        }
+      }
+
 
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
@@ -378,8 +394,11 @@ class PostService {
       throw new Error("Failed to create post (slug collision), please try again");
     }
 
-    eventBus.emit('post.created', { id, slug: finalSlug, timestamp: now, userId });
-    return post;
+      eventBus.emit('post.created', { id, slug: finalSlug, timestamp: now, userId });
+      return post;
+    } finally {
+      release_lock(lockKey);
+    }
   }
 
   async update(id: string, userId: string, data: Partial<Post>, isAdmin: boolean): Promise<Post> {
